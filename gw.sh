@@ -13,6 +13,7 @@ gw() {
       echo "  gw <pattern> <cmd>        Jump and run a command"
       echo "  gw add <branch>           New worktree from existing remote branch"
       echo "  gw create <branch>        New worktree + new branch off main"
+      echo "  gw env                    Copy .env files from main worktree to current"
       echo "  gw cleanup                Multi-select worktrees to remove"
       echo "  gw help                   Show this help"
       echo ""
@@ -37,6 +38,11 @@ gw() {
     add)
       shift
       _gw_add "$@"
+      return $?
+      ;;
+
+    env)
+      _gw_sync_env
       return $?
       ;;
 
@@ -296,4 +302,27 @@ _gw_create() {
 
   cd "$wt_path" || return 1
   echo "-> $(pwd) (branch: $branch, based on: ${main_branch})"
+}
+
+_gw_sync_env() {
+  local repo_root
+  repo_root=$(_gw_repo_root)
+  if [[ -z "$repo_root" ]]; then
+    echo "Not in a git repo."
+    return 1
+  fi
+
+  local main_wt
+  main_wt=$(_gw_main_worktree "$repo_root")
+  if [[ -z "$main_wt" ]]; then
+    echo "Could not find main worktree."
+    return 1
+  fi
+
+  if [[ "$main_wt" == "$repo_root" ]]; then
+    echo "Already in the main worktree — nothing to sync."
+    return 1
+  fi
+
+  _gw_copy_env "$main_wt" "$repo_root"
 }
