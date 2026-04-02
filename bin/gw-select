@@ -1,0 +1,492 @@
+#!/usr/bin/env python3
+"""
+gw-select — interactive git worktree picker with arrow-key navigation.
+
+Modes:
+  Single-select (default): outputs one worktree path to stdout.
+  Multi-select (--multi):  outputs newline-separated paths to stdout.
+
+Usage:
+  gw-select [filter] [--multi]
+"""
+
+import curses
+import os
+import subprocess
+import sys
+
+
+# ── Config ───────────────────────────────────────────────────────────────────
+
+def load_config() -> dict:
+    config = {}
+    config_path = os.path.expanduser("~/.config/gw/config")
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    key, val = line.split("=", 1)
+                    config[key.strip()] = os.path.expanduser(val.strip())
+    return config
+
+
+# ── Git helpers ──────────────────────────────────────────────────────────────
+
+def find_repo_root(start: str | None = None) -> str | None:
+    """Find the git repo root from the current directory."""
+    try:
+        args = ["git", "rev-parse", "--show-toplevel"]
+        if start:
+            args = ["git", "-C", start, "rev-parse", "--show-toplevel"]
+        result = subprocess.run(args, capture_output=True, text=True, timeout=2)
+        return result.stdout.strip() if result.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def get_worktrees(repo: str) -> list[dict]:
+    """Get all worktrees for a repo via `git worktree list`."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", repo, "worktree", "list", "--porcelain"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return []
+    except Exception:
+        return []
+
+    entries = []
+    current: dict = {}
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            if current:
+                entries.append(current)
+            path = line[len("worktree "):]
+            current = {"path": path, "name": os.path.basename(path), "branch": ""}
+        elif line.startswith("branch "):
+            ref = line[len("branch "):]
+            # refs/heads/main -> main
+            current["branch"] = ref.split("/", 2)[-1] if "/" in ref else ref
+        elif line == "detached":
+            current["branch"] = "(detached)"
+        elif line == "bare":
+            current["branch"] = "(bare)"
+        elif line == "" and current:
+            entries.append(current)
+            current = {}
+    if current:
+        entries.append(current)
+
+    return entries
+
+
+# ── Fuzzy matching ───────────────────────────────────────────────────────────
+
+def fuzzy_match(query: str, name: str) -> bool:
+    query = query.lower()
+    name = name.lower()
+    qi = 0
+    for ch in name:
+        if qi < len(query) and ch == query[qi]:
+            qi += 1
+    return qi == len(query)
+
+
+def highlight_match(query: str, name: str) -> list[tuple[int, bool]]:
+    result = []
+    query_lower = query.lower()
+    qi = 0
+    for i, ch in enumerate(name):
+        if qi < len(query_lower) and ch.lower() == query_lower[qi]:
+            result.append((i, True))
+            qi += 1
+        else:
+            result.append((i, False))
+    return result
+
+
+# ── Shared rendering ─────────────────────────────────────────────────────────
+
+def init_colors():
+    curses.curs_set(0)
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_CYAN, -1)                    # header
+    curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_CYAN)    # cursor row
+    curses.init_pair(3, curses.COLOR_WHITE, -1)                   # normal row
+    curses.init_pair(4, curses.COLOR_YELLOW, -1)                  # branch
+    curses.init_pair(5, curses.COLOR_GREEN, -1)                   # match highlight
+    curses.init_pair(6, curses.COLOR_GREEN, curses.COLOR_CYAN)    # match hl on cursor
+    curses.init_pair(7, 8, -1)                                    # dim (footer)
+    curses.init_pair(8, curses.COLOR_YELLOW, curses.COLOR_CYAN)   # branch on cursor
+    curses.init_pair(9, curses.COLOR_RED, -1)                     # checked (multi)
+    curses.init_pair(10, curses.COLOR_RED, curses.COLOR_CYAN)     # checked on cursor
+
+
+def render_row(stdscr, row: int, width: int, entry: dict, is_cursor: bool,
+               query: str, col_branch: int, checkbox: str | None = None):
+    if is_cursor:
+        try:
+            stdscr.addnstr(row, 0, " " * (width - 1), width - 1, curses.color_pair(2))
+        except curses.error:
+            pass
+
+    pointer = " > " if is_cursor else "   "
+    ptr_color = curses.color_pair(2) if is_cursor else curses.color_pair(3)
+    try:
+        stdscr.addnstr(row, 0, pointer, width - 1, ptr_color | curses.A_BOLD)
+    except curses.error:
+        pass
+
+    col = len(pointer)
+
+    if checkbox is not None:
+        cb_attr = curses.color_pair(10) if is_cursor else curses.color_pair(9)
+        try:
+            stdscr.addstr(row, col, checkbox, cb_attr | curses.A_BOLD)
+        except curses.error:
+            pass
+        col += len(checkbox)
+
+    name = entry["name"]
+    if query:
+        matches = highlight_match(query, name)
+        for ci, (_, is_match) in enumerate(matches):
+            if col + ci >= width - 1:
+                break
+            if is_match:
+                attr = curses.color_pair(6) if is_cursor else curses.color_pair(5)
+                attr |= curses.A_BOLD
+            else:
+                attr = curses.color_pair(2) if is_cursor else curses.color_pair(3)
+            try:
+                stdscr.addstr(row, col + ci, name[ci], attr)
+            except curses.error:
+                pass
+    else:
+        name_attr = curses.color_pair(2) if is_cursor else curses.color_pair(3)
+        try:
+            stdscr.addnstr(row, col, name, width - col - 1, name_attr)
+        except curses.error:
+            pass
+
+    branch = entry["branch"]
+    if branch and col_branch + len(branch) < width - 1:
+        br_attr = curses.color_pair(8) if is_cursor else curses.color_pair(4)
+        try:
+            stdscr.addnstr(row, col_branch, branch, width - col_branch - 1, br_attr)
+        except curses.error:
+            pass
+
+
+# ── Single-select picker ─────────────────────────────────────────────────────
+
+def run_picker(stdscr, worktrees: list[dict], initial_filter: str) -> str | None:
+    init_colors()
+    query = initial_filter
+    cursor = 0
+    scroll_offset = 0
+
+    while True:
+        stdscr.erase()
+        height, width = stdscr.getmaxyx()
+
+        filtered = [w for w in worktrees if fuzzy_match(query, w["name"])]
+        if cursor >= len(filtered):
+            cursor = max(0, len(filtered) - 1)
+
+        header_lines = 2
+        footer_lines = 3
+        list_height = max(1, height - header_lines - footer_lines)
+
+        if cursor < scroll_offset:
+            scroll_offset = cursor
+        if cursor >= scroll_offset + list_height:
+            scroll_offset = cursor - list_height + 1
+
+        title = " gw — git worktree switcher"
+        try:
+            stdscr.addnstr(0, 0, title, width - 1, curses.color_pair(1) | curses.A_BOLD)
+        except curses.error:
+            pass
+
+        if not filtered:
+            msg = "  no matches" if query else "  no worktrees found"
+            try:
+                stdscr.addnstr(header_lines, 0, msg, width - 1, curses.color_pair(7))
+            except curses.error:
+                pass
+        else:
+            max_name = max(len(w["name"]) for w in filtered)
+            col_branch = min(max_name + 4, width - 20)
+
+            for i in range(list_height):
+                idx = scroll_offset + i
+                if idx >= len(filtered):
+                    break
+                render_row(stdscr, header_lines + i, width, filtered[idx],
+                           idx == cursor, query, col_branch)
+
+        filter_row = height - footer_lines
+        try:
+            stdscr.addnstr(filter_row, 0, "-" * (width - 1), width - 1, curses.color_pair(7))
+        except curses.error:
+            pass
+        try:
+            stdscr.addnstr(filter_row + 1, 0, f"  filter: {query}_", width - 1, curses.color_pair(1))
+        except curses.error:
+            pass
+        count = f"{len(filtered)}/{len(worktrees)}"
+        hint = f"  up/down navigate  enter select  esc quit  type to filter          {count}"
+        try:
+            stdscr.addnstr(filter_row + 2, 0, hint, width - 1, curses.color_pair(7))
+        except curses.error:
+            pass
+
+        stdscr.refresh()
+
+        try:
+            key = stdscr.get_wch()
+        except curses.error:
+            continue
+
+        if key == "\x1b":
+            return None
+        elif key == "\n" or key == "\r":
+            return filtered[cursor]["path"] if filtered else None
+        elif key == curses.KEY_UP or key == "\x10":
+            cursor = max(0, cursor - 1)
+        elif key == curses.KEY_DOWN or key == "\x0e":
+            cursor = min(len(filtered) - 1, cursor + 1)
+        elif key == curses.KEY_BACKSPACE or key == "\x7f" or key == "\b":
+            query = query[:-1]
+            cursor = 0
+            scroll_offset = 0
+        elif key == "\x15":
+            query = ""
+            cursor = 0
+            scroll_offset = 0
+        elif isinstance(key, str) and key.isprintable() and len(key) == 1:
+            query += key
+            cursor = 0
+            scroll_offset = 0
+
+
+# ── Multi-select picker ─────────────────────────────────────────────────────
+
+def run_multi_picker(stdscr, worktrees: list[dict], initial_filter: str) -> list[str]:
+    init_colors()
+    query = initial_filter
+    cursor = 0
+    scroll_offset = 0
+    selected: set[str] = set()
+
+    while True:
+        stdscr.erase()
+        height, width = stdscr.getmaxyx()
+
+        filtered = [w for w in worktrees if fuzzy_match(query, w["name"])]
+        if cursor >= len(filtered):
+            cursor = max(0, len(filtered) - 1)
+
+        header_lines = 2
+        footer_lines = 3
+        list_height = max(1, height - header_lines - footer_lines)
+
+        if cursor < scroll_offset:
+            scroll_offset = cursor
+        if cursor >= scroll_offset + list_height:
+            scroll_offset = cursor - list_height + 1
+
+        sel_count = len(selected)
+        title = f" gw cleanup — select worktrees to remove ({sel_count} selected)"
+        try:
+            stdscr.addnstr(0, 0, title, width - 1, curses.color_pair(1) | curses.A_BOLD)
+        except curses.error:
+            pass
+
+        if not filtered:
+            msg = "  no matches" if query else "  no worktrees found"
+            try:
+                stdscr.addnstr(header_lines, 0, msg, width - 1, curses.color_pair(7))
+            except curses.error:
+                pass
+        else:
+            max_name = max(len(w["name"]) for w in filtered)
+            col_branch = min(max_name + 8, width - 20)
+
+            for i in range(list_height):
+                idx = scroll_offset + i
+                if idx >= len(filtered):
+                    break
+                entry = filtered[idx]
+                is_checked = entry["path"] in selected
+                checkbox = "[x] " if is_checked else "[ ] "
+                render_row(stdscr, header_lines + i, width, entry,
+                           idx == cursor, query, col_branch, checkbox=checkbox)
+
+        filter_row = height - footer_lines
+        try:
+            stdscr.addnstr(filter_row, 0, "-" * (width - 1), width - 1, curses.color_pair(7))
+        except curses.error:
+            pass
+        try:
+            stdscr.addnstr(filter_row + 1, 0, f"  filter: {query}_", width - 1, curses.color_pair(1))
+        except curses.error:
+            pass
+        count = f"{len(filtered)}/{len(worktrees)}"
+        hint = f"  space toggle  tab toggle+down  a all  enter confirm  esc quit          {count}"
+        try:
+            stdscr.addnstr(filter_row + 2, 0, hint, width - 1, curses.color_pair(7))
+        except curses.error:
+            pass
+
+        stdscr.refresh()
+
+        try:
+            key = stdscr.get_wch()
+        except curses.error:
+            continue
+
+        if key == "\x1b":
+            return []
+        elif key == "\n" or key == "\r":
+            return [w["path"] for w in worktrees if w["path"] in selected]
+        elif key == " ":
+            if filtered:
+                path = filtered[cursor]["path"]
+                selected.symmetric_difference_update({path})
+        elif key == "\t":
+            if filtered:
+                path = filtered[cursor]["path"]
+                selected.symmetric_difference_update({path})
+                cursor = min(len(filtered) - 1, cursor + 1)
+        elif key == "a" and not query:
+            all_paths = {w["path"] for w in filtered}
+            if all_paths <= selected:
+                selected -= all_paths
+            else:
+                selected |= all_paths
+        elif key == curses.KEY_UP or key == "\x10":
+            cursor = max(0, cursor - 1)
+        elif key == curses.KEY_DOWN or key == "\x0e":
+            cursor = min(len(filtered) - 1, cursor + 1)
+        elif key == curses.KEY_BACKSPACE or key == "\x7f" or key == "\b":
+            query = query[:-1]
+            cursor = 0
+            scroll_offset = 0
+        elif key == "\x15":
+            query = ""
+            cursor = 0
+            scroll_offset = 0
+        elif isinstance(key, str) and key.isprintable() and len(key) == 1:
+            query += key
+            cursor = 0
+            scroll_offset = 0
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Interactive git worktree picker")
+    parser.add_argument("filter", nargs="?", default="", help="Initial filter string")
+    parser.add_argument("--multi", action="store_true", help="Multi-select mode")
+    args = parser.parse_args()
+
+    config = load_config()
+
+    # Resolve repo: current git repo, or configured default
+    default_repo_path = config.get("default_repo")
+    repo = find_repo_root()
+    worktrees = get_worktrees(repo) if repo else []
+
+    if repo and len(worktrees) <= 1:
+        # We're in a repo but it has no extra worktrees — ask about default
+        if default_repo_path:
+            default_root = find_repo_root(default_repo_path)
+            if default_root and default_root != repo:
+                default_wts = get_worktrees(default_root)
+                if len(default_wts) > 1:
+                    default_name = os.path.basename(default_root)
+                    current_name = os.path.basename(repo)
+                    print(f"Current repo ({current_name}) has no extra worktrees.", file=sys.stderr)
+                    print(f"Use default repo ({default_name})? [Y/n] ", end="", file=sys.stderr, flush=True)
+                    answer = input()
+                    if answer.strip().lower() not in ("", "y", "yes"):
+                        sys.exit(1)
+                    repo = default_root
+                    worktrees = default_wts
+                else:
+                    print(f"Current repo ({current_name}) has no extra worktrees.", file=sys.stderr)
+                    print("Create one with: git worktree add <path> <branch>", file=sys.stderr)
+                    sys.exit(1)
+            else:
+                print(f"Only {'1 worktree' if worktrees else 'no worktrees'} for {repo}", file=sys.stderr)
+                print("Create one with: git worktree add <path> <branch>", file=sys.stderr)
+                sys.exit(1)
+        else:
+            print(f"Only {'1 worktree' if worktrees else 'no worktrees'} for {repo}", file=sys.stderr)
+            print("Create one with: git worktree add <path> <branch>", file=sys.stderr)
+            sys.exit(1)
+    elif not repo:
+        # Not in a git repo at all — ask about default
+        if default_repo_path:
+            default_root = find_repo_root(default_repo_path)
+            if default_root:
+                default_wts = get_worktrees(default_root)
+                if len(default_wts) > 1:
+                    default_name = os.path.basename(default_root)
+                    print(f"Not in a git repo.", file=sys.stderr)
+                    print(f"Use default repo ({default_name})? [Y/n] ", end="", file=sys.stderr, flush=True)
+                    answer = input()
+                    if answer.strip().lower() not in ("", "y", "yes"):
+                        sys.exit(1)
+                    repo = default_root
+                    worktrees = default_wts
+                else:
+                    print("Not in a git repo, and default_repo has no worktrees.", file=sys.stderr)
+                    sys.exit(1)
+            else:
+                print(f"Not in a git repo, and default_repo ({default_repo_path}) is not a git repo.", file=sys.stderr)
+                sys.exit(1)
+        else:
+            print("Not in a git repo. Set a default in ~/.config/gw/config:", file=sys.stderr)
+            print("  default_repo=~/code/your-repo", file=sys.stderr)
+            sys.exit(1)
+
+    # Single-select fast path
+    if not args.multi and args.filter:
+        matches = [w for w in worktrees if fuzzy_match(args.filter, w["name"])]
+        if len(matches) == 1:
+            print(matches[0]["path"])
+            sys.exit(0)
+
+    # Redirect stdout to /dev/tty so curses paints to the terminal
+    result_fd = os.dup(sys.stdout.fileno())
+    tty = open("/dev/tty", "w")
+    os.dup2(tty.fileno(), sys.stdout.fileno())
+
+    if args.multi:
+        results = curses.wrapper(run_multi_picker, worktrees, args.filter)
+    else:
+        result = curses.wrapper(run_picker, worktrees, args.filter)
+        results = [result] if result else []
+
+    os.dup2(result_fd, sys.stdout.fileno())
+    os.close(result_fd)
+    tty.close()
+
+    if results:
+        for r in results:
+            print(r)
+        sys.exit(0)
+    else:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
