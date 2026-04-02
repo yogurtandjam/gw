@@ -81,6 +81,36 @@ _gw_main_branch() {
   fi
 }
 
+_gw_main_worktree() {
+  # Find the main worktree (the non-linked one with an actual .git directory)
+  local repo="$1"
+  git -C "$repo" worktree list --porcelain 2>/dev/null | head -1 | sed 's/^worktree //'
+}
+
+_gw_copy_env() {
+  # Copy all .env* files from main worktree to new worktree, preserving paths
+  local main_wt="$1"
+  local new_wt="$2"
+
+  if [[ -z "$main_wt" || -z "$new_wt" ]]; then
+    return
+  fi
+
+  local count=0
+  while IFS= read -r -d '' env_file; do
+    local rel="${env_file#$main_wt/}"
+    local dest="${new_wt}/${rel}"
+    local dest_dir="${dest%/*}"
+    [[ -d "$dest_dir" ]] || mkdir -p "$dest_dir"
+    cp "$env_file" "$dest"
+    ((count++))
+  done < <(find "$main_wt" -name '.env*' -not -path '*node_modules*' -not -path '*/.git/*' -print0 2>/dev/null)
+
+  if [[ $count -gt 0 ]]; then
+    echo "  Copied ${count} .env file(s) from main worktree"
+  fi
+}
+
 # ── Commands ─────────────────────────────────────────────────────────────────
 
 _gw_switch() {
@@ -217,6 +247,8 @@ _gw_add() {
     || git -C "$repo_root" worktree add "$wt_path" "$branch" \
     || return 1
 
+  _gw_copy_env "$(_gw_main_worktree "$repo_root")" "$wt_path"
+
   cd "$wt_path" || return 1
   echo "-> $(pwd) (branch: $branch)"
 }
@@ -259,6 +291,8 @@ _gw_create() {
 
   echo "Creating worktree at ${wt_path##*/} (new branch: ${branch} off ${main_branch})..."
   git -C "$repo_root" worktree add -b "$branch" "$wt_path" "origin/${main_branch}" || return 1
+
+  _gw_copy_env "$(_gw_main_worktree "$repo_root")" "$wt_path"
 
   cd "$wt_path" || return 1
   echo "-> $(pwd) (branch: $branch, based on: ${main_branch})"
