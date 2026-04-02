@@ -364,7 +364,7 @@ def run_multi_picker(stdscr, worktrees: list[dict], initial_filter: str) -> list
             return []
         elif key == "\n" or key == "\r":
             return [w["path"] for w in worktrees if w["path"] in selected]
-        elif key == " ":
+        elif key == " " or key == ord(" "):
             if filtered:
                 path = filtered[cursor]["path"]
                 selected.symmetric_difference_update({path})
@@ -391,7 +391,7 @@ def run_multi_picker(stdscr, worktrees: list[dict], initial_filter: str) -> list
             query = ""
             cursor = 0
             scroll_offset = 0
-        elif isinstance(key, str) and key.isprintable() and len(key) == 1:
+        elif isinstance(key, str) and key.isprintable() and len(key) == 1 and key != " ":
             query += key
             cursor = 0
             scroll_offset = 0
