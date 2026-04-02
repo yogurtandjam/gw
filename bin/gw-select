@@ -292,7 +292,7 @@ def run_multi_picker(stdscr, worktrees: list[dict], initial_filter: str) -> list
         if cursor >= len(filtered):
             cursor = max(0, len(filtered) - 1)
 
-        header_lines = 2
+        header_lines = 3
         footer_lines = 3
         list_height = max(1, height - header_lines - footer_lines)
 
@@ -302,9 +302,18 @@ def run_multi_picker(stdscr, worktrees: list[dict], initial_filter: str) -> list
             scroll_offset = cursor - list_height + 1
 
         sel_count = len(selected)
-        title = f" gw cleanup — select worktrees to remove ({sel_count} selected)"
+        title = " gw cleanup — select worktrees to remove"
         try:
             stdscr.addnstr(0, 0, title, width - 1, curses.color_pair(1) | curses.A_BOLD)
+        except curses.error:
+            pass
+        # Controls bar — prominent so the user knows what keys to press
+        controls = "  [space] select   [enter] done   [esc] cancel"
+        sel_label = f"  {sel_count} selected" if sel_count else ""
+        try:
+            stdscr.addnstr(1, 0, controls, width - 1, curses.color_pair(5) | curses.A_BOLD)
+            if sel_label:
+                stdscr.addnstr(1, len(controls), sel_label, width - len(controls) - 1, curses.color_pair(9) | curses.A_BOLD)
         except curses.error:
             pass
 
@@ -338,7 +347,7 @@ def run_multi_picker(stdscr, worktrees: list[dict], initial_filter: str) -> list
         except curses.error:
             pass
         count = f"{len(filtered)}/{len(worktrees)}"
-        hint = f"  space toggle  tab toggle+down  a all  enter confirm  esc quit          {count}"
+        hint = f"  tab select+down  a toggle all          {count}"
         try:
             stdscr.addnstr(filter_row + 2, 0, hint, width - 1, curses.color_pair(7))
         except curses.error:
