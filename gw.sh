@@ -68,11 +68,14 @@ _gw_repo_root() {
 _gw_worktree_path() {
   # Given a branch name, produce the sibling worktree directory path.
   # e.g. branch "anton/checkout-fix" in repo "funkit" -> ../funkit-anton-checkout-fix
+  # Always uses the *main* worktree's name as the prefix, regardless of cwd.
   local repo_root="$1"
   local branch="$2"
-  local repo_name="${repo_root##*/}"
+  local main_wt
+  main_wt=$(_gw_main_worktree "$repo_root")
+  local repo_name="${main_wt##*/}"
   local sanitized="${branch//\//-}"
-  echo "${repo_root%/*}/${repo_name}-${sanitized}"
+  echo "${main_wt%/*}/${repo_name}-${sanitized}"
 }
 
 _gw_main_branch() {
@@ -296,7 +299,11 @@ _gw_create() {
   git -C "$repo_root" fetch origin "${main_branch}" || return 1
 
   echo "Creating worktree at ${wt_path##*/} (new branch: ${branch} off ${main_branch})..."
-  git -C "$repo_root" worktree add -b "$branch" "$wt_path" "origin/${main_branch}" || return 1
+  # --no-track: branch off origin/main without inheriting it as upstream. Otherwise git's
+  # default for a remote-tracking start-point is --track, which leaves the new branch
+  # tracking origin/main — so `git pull` would pull main and `git push` is ambiguous.
+  # With no upstream, the first `git push -u` (or `gpush`) sets the correct origin/<branch>.
+  git -C "$repo_root" worktree add --no-track -b "$branch" "$wt_path" "origin/${main_branch}" || return 1
 
   _gw_copy_env "$(_gw_main_worktree "$repo_root")" "$wt_path"
 
