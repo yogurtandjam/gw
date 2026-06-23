@@ -13,6 +13,7 @@ gw() {
       echo "  gw <pattern> <cmd>        Jump and run a command"
       echo "  gw add <branch>           New worktree from existing remote branch"
       echo "  gw create <branch>        New worktree + new branch off main"
+      echo "  gw stack <branch>         New worktree + new branch off the CURRENT branch"
       echo "  gw env                    Copy .env files from main worktree to current"
       echo "  gw cleanup                Multi-select worktrees to remove"
       echo "  gw help                   Show this help"
@@ -23,6 +24,7 @@ gw() {
       echo "  gw anton claude           cd into it and launch claude"
       echo "  gw add fix/balance-bug    Checkout remote branch into new worktree"
       echo "  gw create feat/new-thing  Create new branch off main in new worktree"
+      echo "  gw stack feat/part-2      Stack a new branch off the current branch"
       echo "  gw cleanup                Select and remove stale worktrees"
       echo ""
       echo "Config: ~/.config/gw/config"
@@ -49,6 +51,12 @@ gw() {
     create)
       shift
       _gw_create "$@"
+      return $?
+      ;;
+
+    stack)
+      shift
+      _gw_stack "$@"
       return $?
       ;;
 
@@ -268,8 +276,23 @@ _gw_create() {
     echo "  Creates a new branch off main in a new worktree."
     return 1
   fi
+  _gw_new_branch_worktree "$1" main
+}
 
+_gw_stack() {
+  if [[ -z "$1" ]]; then
+    echo "Usage: gw stack <branch>"
+    echo "  Creates a new branch off the CURRENT branch in a new worktree (for PR stacks)."
+    return 1
+  fi
+  _gw_new_branch_worktree "$1" current
+}
+
+# Shared worker for `create` (mode=main) and `stack` (mode=current).
+_gw_new_branch_worktree() {
   local branch="$1"
+  local mode="$2"   # "main": fetch + branch off origin/main; "current": branch off local HEAD
+
   local repo_root
   repo_root=$(_gw_repo_root)
   if [[ -z "$repo_root" ]]; then
@@ -292,23 +315,35 @@ _gw_create() {
     return 0
   fi
 
-  local main_branch
-  main_branch=$(_gw_main_branch "$repo_root")
+  local base_branch start_point
+  if [[ "$mode" == "current" ]]; then
+    # Stack off the LOCAL tip of the current branch — including unpushed commits, which
+    # is the whole point of stacking (the parent PR may not be merged or pushed yet).
+    # No fetch: we want local state, and origin/<parent> may not even exist.
+    base_branch=$(git -C "$repo_root" symbolic-ref --short HEAD 2>/dev/null)
+    if [[ -z "$base_branch" ]]; then
+      echo "Detached HEAD — can't determine the current branch to stack on."
+      return 1
+    fi
+    start_point="$base_branch"
+  else
+    base_branch=$(_gw_main_branch "$repo_root")
+    echo "Fetching latest ${base_branch}..."
+    git -C "$repo_root" fetch origin "${base_branch}" || return 1
+    start_point="origin/${base_branch}"
+  fi
 
-  echo "Fetching latest ${main_branch}..."
-  git -C "$repo_root" fetch origin "${main_branch}" || return 1
-
-  echo "Creating worktree at ${wt_path##*/} (new branch: ${branch} off ${main_branch})..."
-  # --no-track: branch off origin/main without inheriting it as upstream. Otherwise git's
-  # default for a remote-tracking start-point is --track, which leaves the new branch
-  # tracking origin/main — so `git pull` would pull main and `git push` is ambiguous.
-  # With no upstream, the first `git push -u` (or `gpush`) sets the correct origin/<branch>.
-  git -C "$repo_root" worktree add --no-track -b "$branch" "$wt_path" "origin/${main_branch}" || return 1
+  echo "Creating worktree at ${wt_path##*/} (new branch: ${branch} off ${base_branch})..."
+  # --no-track: branch off the start-point without inheriting it as upstream. Otherwise
+  # git's default for a remote/branch start-point leaves the new branch tracking it, so
+  # `git pull` pulls the wrong branch and `git push` is ambiguous. With no upstream, the
+  # first `git push -u` (or `gpush`) sets the correct origin/<branch>.
+  git -C "$repo_root" worktree add --no-track -b "$branch" "$wt_path" "$start_point" || return 1
 
   _gw_copy_env "$(_gw_main_worktree "$repo_root")" "$wt_path"
 
   cd "$wt_path" || return 1
-  echo "-> $(pwd) (branch: $branch, based on: ${main_branch})"
+  echo "-> $(pwd) (branch: $branch, based on: ${base_branch})"
 }
 
 _gw_sync_env() {
