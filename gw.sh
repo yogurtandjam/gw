@@ -11,7 +11,7 @@ gw() {
       echo "  gw                        Interactive picker for current repo's worktrees"
       echo "  gw <pattern>              Jump to matching worktree (fuzzy match)"
       echo "  gw <pattern> <cmd>        Jump and run a command"
-      echo "  gw add <branch>           New worktree from existing remote branch"
+      echo "  gw add <branch>           New worktree from existing branch (remote, else local)"
       echo "  gw create <branch>        New worktree + new branch off main"
       echo "  gw stack <branch>         New worktree + new branch off the CURRENT branch"
       echo "  gw env                    Copy .env files from main worktree to current"
@@ -22,7 +22,7 @@ gw() {
       echo "  gw                        Open picker"
       echo "  gw anton                  cd into worktree matching 'anton'"
       echo "  gw anton claude           cd into it and launch claude"
-      echo "  gw add fix/balance-bug    Checkout remote branch into new worktree"
+      echo "  gw add fix/balance-bug    Checkout an existing branch into a new worktree"
       echo "  gw create feat/new-thing  Create new branch off main in new worktree"
       echo "  gw stack feat/part-2      Stack a new branch off the current branch"
       echo "  gw cleanup                Select and remove stale worktrees"
@@ -222,7 +222,7 @@ _gw_cleanup() {
 _gw_add() {
   if [[ -z "$1" ]]; then
     echo "Usage: gw add <branch>"
-    echo "  Creates a worktree from an existing remote branch."
+    echo "  Creates a worktree from an existing branch (remote, else local)."
     return 1
   fi
 
@@ -249,24 +249,45 @@ _gw_add() {
     return 0
   fi
 
+  # git refuses to check out a branch that's already live in another worktree (e.g.
+  # the branch you're currently on). Detect that and offer to jump there instead.
+  local existing_wt
+  existing_wt=$(git -C "$repo_root" worktree list --porcelain 2>/dev/null \
+    | awk -v b="refs/heads/${branch}" '/^worktree /{p=substr($0,10)} $0=="branch "b{print p}')
+  if [[ -n "$existing_wt" ]]; then
+    echo "Branch '${branch}' is already checked out at: ${existing_wt##*/}"
+    echo -n "cd into it? [Y/n] "
+    read -r confirm
+    if [[ "$confirm" == "n" || "$confirm" == "N" ]]; then
+      return 1
+    fi
+    cd "$existing_wt" || return 1
+    echo "-> $(pwd) (branch: $branch)"
+    return 0
+  fi
+
   echo "Fetching latest..."
   git -C "$repo_root" fetch --prune || return 1
 
-  # Check if the branch exists on remote
+  # Prefer a remote branch (track it); fall back to an existing local branch.
   local remote_ref
   remote_ref=$(git -C "$repo_root" branch -r --list "origin/${branch}" 2>/dev/null | head -1 | xargs)
-  if [[ -z "$remote_ref" ]]; then
-    echo "Branch '${branch}' not found on remote."
+  if [[ -n "$remote_ref" ]]; then
+    echo "Creating worktree at ${wt_path##*/} (tracking origin/${branch})..."
+    git -C "$repo_root" worktree add --track -b "$branch" "$wt_path" "origin/${branch}" 2>/dev/null \
+      || git -C "$repo_root" worktree add "$wt_path" "$branch" \
+      || return 1
+  elif git -C "$repo_root" rev-parse --verify --quiet "refs/heads/${branch}" >/dev/null; then
+    echo "No remote branch; using local branch '${branch}'."
+    echo "Creating worktree at ${wt_path##*/}..."
+    git -C "$repo_root" worktree add "$wt_path" "$branch" || return 1
+  else
+    echo "Branch '${branch}' not found on remote or locally."
     echo ""
     echo "Did you mean one of these?"
-    git -C "$repo_root" branch -r --list "*${branch}*" 2>/dev/null | head -5 | sed 's/^ */  /'
+    git -C "$repo_root" branch -a --list "*${branch}*" 2>/dev/null | head -5 | sed 's/^[*+ ] */  /'
     return 1
   fi
-
-  echo "Creating worktree at ${wt_path##*/}..."
-  git -C "$repo_root" worktree add --track -b "$branch" "$wt_path" "origin/${branch}" 2>/dev/null \
-    || git -C "$repo_root" worktree add "$wt_path" "$branch" \
-    || return 1
 
   _gw_copy_env "$(_gw_main_worktree "$repo_root")" "$wt_path"
 
