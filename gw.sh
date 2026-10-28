@@ -128,6 +128,19 @@ _gw_copy_env() {
   fi
 }
 
+_gw_install_deps() {
+  # Install dependencies in a freshly created worktree so husky/commitlint hooks
+  # and tooling work immediately. No-op without a package.json or pnpm.
+  local wt="$1"
+  [[ -n "$wt" && -f "${wt}/package.json" ]] || return 0
+  if ! command -v pnpm >/dev/null 2>&1; then
+    echo "  pnpm not found — skipping install"
+    return 0
+  fi
+  echo "  Installing dependencies (pnpm install)..."
+  (cd "$wt" && pnpm install)
+}
+
 # ── Commands ─────────────────────────────────────────────────────────────────
 
 _gw_switch() {
@@ -366,6 +379,7 @@ _gw_new_branch_worktree() {
   git -C "$repo_root" worktree add --no-track -b "$branch" "$wt_path" "$start_point" || return 1
 
   _gw_copy_env "$(_gw_main_worktree "$repo_root")" "$wt_path"
+  _gw_install_deps "$wt_path"
 
   cd "$wt_path" || return 1
   echo "-> $(pwd) (branch: $branch, based on: ${base_branch})"
