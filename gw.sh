@@ -198,10 +198,14 @@ _gw_cleanup() {
   local failed=0
   for d in "${dirs[@]}"; do
     local name="${d##*/}"
-    if [[ -n "$main_repo" ]] && git -C "$main_repo" worktree remove --force "$d" 2>/dev/null; then
-      echo "  Removed worktree: ${name}"
+    # git can unregister the worktree yet leave the directory behind, so always sweep leftovers
+    [[ -n "$main_repo" ]] && git -C "$main_repo" worktree remove --force "$d" 2>/dev/null
+    [[ -e "$d" ]] && rm -rf "$d"
+    if [[ -e "$d" ]]; then
+      echo "  FAILED: ${name}"
+      ((failed++))
     else
-      rm -rf "$d" && echo "  Deleted: ${name}" || { echo "  FAILED: ${name}"; ((failed++)); }
+      echo "  Removed: ${name}"
     fi
   done
 
